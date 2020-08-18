@@ -13,5 +13,10 @@ Complier: g++ 9.3.0
     实现了基于红黑树的定时器； 
     实现了基于互斥锁mutex和条件变量的任务队列； 
     采用eventfd或条件变量的方法实现线程间的唤醒。
+    
 4,Model
 并发模型为Multiple Reactors+非阻塞IO+线程池，新连接Round Robin分配
+
+5,其他说明
+zd目录下存放的是测试数据，包括图片文件和文本文件
+
