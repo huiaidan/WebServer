@@ -50,7 +50,7 @@ void Acceptor::NewConnectionCallback()
 		loop->get_channel()->revent_init(conn);
 	else{
 		Channel* channel=loops[this->i]->get_channel();
-		loops[this->i]->runInLoop(boost::bind(&Channel::revent_init,channel,conn));////////////////////////////////////////
+		loops[this->i]->runInLoop(boost::bind(&Channel::revent_init,channel,conn));
 		i++;
 	if(i==EVENTLOOPTHREADNUM)
 		this->i=0;}
