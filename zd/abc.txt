@@ -1,0 +1,247 @@
+
+前言
+http协议是互联网中最重要的协议之一，虽然看上去很简单，但是实际中经常遇到问题，我们就已经遇到好几次了。有长连接相关的，有报文解析相关的。对http协议不能一知半解，必须透彻理解才行。本文通过一个线上实例，详细介绍http协议中的content-length字段。
+
+问题
+我们的手机App在做更新时会从服务器上下载的一些资源，一般都是一些小文件，更新的代码差不多是下面这样的：
+
+static void update() throws IOException {
+    URL url = new URL("http://172.16.59.129:8000/update/test.so");
+    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+    if(conn.getResponseCode() == 200) {
+        int totalLength = conn.getContentLength();
+	BufferedInputStream in = new BufferedInputStream(conn.getInputStream());
+	byte[] buffer = new byte[512];
+	int readLength = 0;
+	int length = 0;
+	while((length=in.read(buffer)) != -1) {
+		readLength += length;
+		//进度条
+		System.out.println(((float)readLength) /((float)(totalLength)));
+	}
+    }
+}
+比如上面的代码更新一个so文件，先通过content-length获取文件的总大小，然后读Stream，每读一段，就计算出当前读的总大小，除以content-length，用来显示进度条。
+
+结果weblogic从10升级到12后，content-length一直返回-1，这样就不能显示进度条了，但是文件流还能正常读。把weblogic重启了，一开始还能返回content-length，一会又是-1了。
+
+原因分析
+Http协议的请求报文和回复报文都有header和body，body就是你要获取的资源，例如一个html页面，一个jpeg图片，而header是用来做某些约定的。例如客户端与服务端商定一些传输格式，客户端先获取头部，得知一些格式信息，然后才开始读取body。
+
+客户端： Accept-Encoding:gzip （给我压缩一下，我用的是流量，先下载下来我再慢慢解压吧）
+
+服务端1：Content-Encoding:null(没有Content-Encoding头。 我不给压缩，CPU没空，你爱要不要）
+
+服务端2：Content-Encoding:gzip (给你节省流量，压缩一下）
+
+客户端：Connection: keep-alive (大哥，咱好不容易建了个TCP连接，下次接着用）
+
+服务端1: Connection: keep-alive （都不容易，接着用）
+
+服务端2: Connection: close (谁跟你接着用，我们这个TCP是一次性的，下次再找我还得重新连)
+
+http协议没有三次握手，一般客户端向服务端请求资源时，以服务端为准。还有一些header并没有协商的过程，而是服务端直接告诉客户端按什么来。例如上述的Content-Length，是服务端告诉客户端body的大小有多大。但是！服务端并不一定能准确的提前告诉你body有多大。服务端要先写header，再写body，如果要在header里把body大小写进去，就得提前知道body大小。如果这个body是动态生成的，服务端先生成完，再开始写header，这样需要很多额外的开销，所以header里不一定有content-length。
+
+那客户端怎么知道body的大小呢？服务器有三种方式告诉你。
+
+1.服务器已经知道资源大小，通过content-length这个header告诉你。
+
+Content-Length:1076(body的大小是1076B，你读取1076B就可以完成任务了）
+Transfer-Encoding: null
+2.服务器没法提前知道资源的大小，或者不愿意花费资源提前计算资源大小，就会把http回复报文中加一个header叫Transfer-Encoding:chunked，就是分块传输的意思。每一块都使用固定的格式，前边是块的大小，后面是数据，然后最后一块大小是0。这样客户端解析的时候就需要注意去掉一些无用的字段。
+
+Content-Length:null
+Transfer-Encoding:chunked (接下来的body我要一块一块的传，每一块开始是这一块的大小，等我传到大小为0的块时，就没了）
+3.服务器不知道资源的大小，同时也不支持chunked的传输模式，那么就既没有content-length头，也没有transfer-encoding头，这种情况下必须使用短连接，以连接结束来标示数据传输结束，传输结束就能知道大小了。这时候服务器返回的header里Connection一定是close。
+
+Content-Length:null
+
+Transfer-Encoding:null
+
+Connection:close(我不知道大小，我也用不了chunked，啥时候我关了tcp连接，就说明传输结束了）
+实验
+我通过nginx在虚拟机里做实验，默认nginx是支持chunked模式的，可以关掉。
+
+使用的代码如下，可能会调整参数。
+
+static void update() throws IOException {
+    URL url = new URL("http://172.16.59.129:8000/update/test.so");
+    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+    //conn.setRequestProperty("Accept-Encoding", "gzip");
+    //conn.setRequestProperty("Connection", "keep-alive");
+    conn.connect();
+    if(conn.getResponseCode() == 200) {
+        System.out.println(conn.getHeaderFields().keySet());
+        System.out.println(conn.getHeaderField("transfer-encoding"));
+        System.out.println(conn.getHeaderField("Content-Length"));
+        System.out.println(conn.getHeaderField("Content-Encoding"));
+        System.out.println(conn.getHeaderField("Connection"));
+    }
+}
+1.nginx在开启chunked_transfer_encoding的时候
+(1) 在reqeust header里不使用gzip，也就是不加accept-encoding:gzip
+
+test.so文件大小	结果
+100B	能正常返回content-length,没有transfer-encoding头
+69M	能正常返回content-length,没有transfer-encoding头
+3072M	能正常返回content-length,没有transfer-encoding头
+可以发现nginx不管资源多大，如果客户端不接受gzip的压缩格式，就不会使用chunked模式，而且跟是否使用短连接没关系。
+
+(2)在request header里加入gzip，accepting-encoding:gzip
+
+test.so文件大小	结果
+100B	没有content-length,transfer-encoding=trunked
+69M	没有content-length,transfer-encoding=trunked
+3072M	没有content-length,transfer-encoding=trunked
+可以看到nginx在开启chunked_transfer_encoding，并且客户端接受gzip的时候，会使用chunked模式，nginx开启gzip后不会计算资源的大小，直接用chunked模式。
+
+2.nginx关闭chunked_transfer_encoding
+(1) 在reqeust header里不使用gzip，也就是不加accept-encoding:gzip
+
+test.so文件大小	结果
+100B	能正常返回content-length,没有transfer-encoding头
+69M	能正常返回content-length,没有transfer-encoding头
+3072M	能正常返回content-length,没有transfer-encoding头
+因为能很容易的知道文件大小，所以nginx还是能返回content-length。
+
+(2)在request header里加入gzip，accepting-encoding:gzip
+
+test.so文件大小	结果
+100B	没有content-length和transfer-encoding头，不论客户端connection为keep-alive还是close，服务端返回的connection头都是close
+69M	没有content-length和transfer-encoding头，不论客户端connection为keep-alive还是close，服务端返回的connection头都是close
+3072M	没有content-length和transfer-encoding头，不论客户端connection为keep-alive还是close，服务端返回的connection头都是close
+这就是上面说的第三种情况，不知道大小，也不支持trunked，那就必须使用短连接来标示结束。
+
+问题解决方案
+咨询了中间件组的同事，以前也遇到类似的问题，因为升级了Weblogic导致客户端解析XML出错，因为使用了chunked模式，中间有一些格式化的字符，而客户端解析的代码并没有考虑chunked模式的解析，导致解析出错。
+
+因为我们客户端必须用content-length展示进度，因此不能用chunked模式，Weblogic可以把chunked模式关闭。用下面的方法：
+
+#!java weblogic.WLST 
+connect('username’,'password', 't3://localhost:7001')
+edit()
+startEdit()
+cd("Servers/AdminServer/WebServer/AdminServer")
+cmo.setChunkedTransferDisabled(true)
+save()
+activate()
+exit()
+改了之后，确实不返回chunked了，但是也没有content-length，因为Weblogic就是不提前获取文件大小，而是强制加了connection:close，也就是前边说的第三种，通过连接结束标识数据结束。最后只能把这些资源放倒apache里了。
+
+总结
+一个好的http客户端，必须充分实现协议，不然就可能出问题，浏览器对于服务端可能产生的各种情况都很好的做了处理，但是自己实现http协议的解析时一定得注意考虑多种情况。
+
+标签: Http协议, Content-Length, Chunked, Weblogic
+好文要顶 关注我 收藏该文    
+牛哥的博客
+关注 - 3
+粉丝 - 6
++加关注
+2 0
+« 上一篇： 异步处理ServletRequest引发的血案 
+» 下一篇： 通过实例理解Java网络IO模型
+posted @ 2019-10-14 12:51  牛哥的博客  阅读(19248)  评论(0)  编辑  收藏
+刷新评论刷新页面返回顶部
+发表评论
+编辑
+预览
+ 
+支持 Markdown
+ 退出 订阅评论
+
+[Ctrl+Enter快捷键提交]
+
+【推荐】超50万行VC++源码: 大型组态工控、电力仿真CAD与GIS源码库
+【推荐】了不起的开发者，挡不住的华为，园子里的品牌专区
+【推荐】精品问答：大数据常见问题之 flink 五十问
+
+相关博文：
+· Http协议之Content-Length
+· http响应头里没有或者有content-length的几种可能性
+· HTTP协议中Content-Length的详细解读。
+· HTTP之Content-Length
+· Http协议中关于Content-Length的解读【出现坑爹的视频中断】
+» 更多推荐...
+最新 IT 新闻: 
+· 小红书上线视频号 将支持15分钟时长视频发布 
+· 想向美团开枪的，居然是京东 
+· 体验索尼降噪新旗舰：你可以戴着降噪耳机和旁边人说话了 
+· 像素发明者罗素 · 基尔希去世 享年91岁 
+· Gartner发布云产品评估报告：阿里云计算能力全球第一 
+» 更多新闻...
+昵称： 牛哥的博客 
+园龄： 7年4个月 
+粉丝： 6 
+关注： 3
++加关注
+<	2020年8月	>
+日	一	二	三	四	五	六
+26	27	28	29	30	31	1
+2	3	4	5	6	7	8
+9	10	11	12	13	14	15
+16	17	18	19	20	21	22
+23	24	25	26	27	28	29
+30	31	1	2	3	4	5
+搜索
+
+ 
+
+ 
+常用链接
+我的随笔
+我的评论
+我的参与
+最新评论
+我的标签
+我的标签
+JVM(2)
+Arthas(2)
+Btrace(2)
+在线调试(2)
+栈溢出(1)
+阻塞IO(1)
+Chunked(1)
+Content-Length(1)
+Docker(1)
+Dubbo(1)
+更多
+随笔分类
+Java与JVM(2)
+云计算(1)
+随笔档案
+2019年11月(1)
+2019年10月(7)
+相册
+topo(1)
+最新评论
+1. Re:Dubbo与Kubernetes集成
+Dubbo的某些版本，是不能使用DUBBO_PORT_TO_REGISTRY和DUBBO_PORT_TO_BIND指定端口号的，因为源码中判断端口号是否合法时，是错的。
+
+
+--huxiutao
+2. Re:Dubbo与Kubernetes集成
+@裤裆内隐藏杀气 那是因为你的DUBBO_IP_TO_REGISTRY设置是按照文中的设置，没有起作用造成的 - name: DUBBO_IP_TO_REGISTRY valueFrom: field...
+--huxiutao
+3. Re:Dubbo与Kubernetes集成
+作者怎么联系? 我zk上显示还是pod中的IP...  怎么联系作者
+--裤裆内隐藏杀气
+4. Re:异步处理ServletRequest引发的血案
+好像我们的代码也这样做了，赶紧去看看有问题吗。。。。。。
+--lovewang
+5. Re:利用JVM在线调试工具排查线上问题
+--来自非洲大草原的食人虎
+阅读排行榜
+1. Http协议Content-Length详解(19243)
+2. Dubbo与Kubernetes集成(1807)
+3. 利用JVM在线调试工具排查线上问题(1532)
+4. 利用Arthas定位线上问题实例(876)
+5. 通过实例理解Java网络IO模型(690)
+评论排行榜
+1. Dubbo与Kubernetes集成(3)
+2. 利用JVM在线调试工具排查线上问题(1)
+3. 异步处理ServletRequest引发的血案(1)
+推荐排行榜
+1. 利用JVM在线调试工具排查线上问题(6)
+2. 异步处理ServletRequest引发的血案(3)
+3. 通过实例理解Java网络IO模型(3)
+4. Http协议Content-Length详解(2)
